@@ -1,4 +1,5 @@
 import requests
+from requests.exceptions import HTTPError, Timeout
 import heapq
 import os
 import sys
@@ -22,23 +23,52 @@ search_stop_event = threading.Event()
 plotting_failed = False
 pause_plot_updates = threading.Event()
 
-def show_route_summary_popup(route):
-    def build_text():
-        lines = ["Final Route:"]
-        total = 0.0
-        for i in range(len(route)):
-            line = f"{i+1}. {route[i]}"
-            if i > 0:
-                a = get_coordinates(route[i - 1])
-                b = get_coordinates(route[i])
-                dist = distance_squared(a, b) ** 0.5
-                total += dist
-                line += f"  ({dist:.2f} ly)"
-            lines.append(line)
-        lines.append(f"\nTotal Distance: {total:.2f} ly")
-        return "\n".join(lines)
+def distance_squared(a, b):
+    return sum((a[i] - b[i]) ** 2 for i in range(3))
 
-    summary_text = build_text()
+def get_coordinates(system_name):
+    if system_name not in coords_cache:
+        raise ValueError(f"No cached coordinates for {system_name}")
+    return coords_cache[system_name]
+
+def get_api_data(sys_name, task):
+    """talk to the Ardent API to get various data of star systems"""
+    match task:
+        case "refuel_system":
+            url = f"{ARDENT_BASE}/{sys_name}/nearest/refuel"
+        case "colo_distance":
+            url = f"{ARDENT_BASE}/{sys_name}/nearby?maxDistance=15.0000"
+        case "system":
+            url = f"{ARDENT_BASE}/{sys_name}"
+    try:
+        r = requests.get(url, timeout=(5, 10))
+        r.raise_for_status()
+    except HTTPError as http_err:
+        print(f"Connection error occurred: {http_err}")
+    except Timeout:
+        print("Request timed out!")
+    return r.json()
+
+# maybe rename this one
+def route_to_str(route):
+    lines = ["📡 Final route with distances between jumps:"]
+    total = float()
+    for i in range(len(route)):
+        line = [f"{i+1}.\t{route[i]}"]
+        if i > 0:
+            a = get_coordinates(route[i - 1])
+            b = get_coordinates(route[i])
+            dist = distance_squared(a, b) ** 0.5
+            total += dist
+            line.append(f"\t\t({dist:.2f} Ly)")
+        else:
+            line.append(f"\t\t(start)")
+        lines.append(''.join(line))
+    lines.append(f"\nTotal Distance: {total:.2f} Ly")
+    return "\n".join(lines)
+
+def show_route_summary_popup(route):
+    summary_text = route_to_str(route)
 
     win = tk.Toplevel()
     win.title("Route Summary")
@@ -69,22 +99,13 @@ def show_route_summary_popup(route):
     # Close button
     tk.Button(win, text="Close", command=win.destroy, font=("Helvetica", 11)).pack(pady=5)
 
-def distance_squared(a, b):
-    return sum((a[i] - b[i]) ** 2 for i in range(3))
 
-def get_coordinates(system_name):
-    if system_name not in coords_cache:
-        raise ValueError(f"No cached coordinates for {system_name}")
-    return coords_cache[system_name]
 
 def get_populated_targets(start_system):
     if start_system in refuel_cache:
         return refuel_cache[start_system]
 
-    url = f"{ARDENT_BASE}/{start_system}/nearest/refuel"
-    r = requests.get(url)
-    r.raise_for_status()
-    raw_systems = r.json()
+    raw_systems = get_api_data(start_system, "refuel_system")
 
     allowed_station_types = {"Outpost", "Coriolis", "Ocellus", "Orbis"}
     filtered = []
@@ -110,13 +131,10 @@ def get_nearby_systems(system_name):
     if system_name in nearby_cache:
         return nearby_cache[system_name]
 
-    url = f"{ARDENT_BASE}/{system_name}/nearby?maxDistance=15.0000"
-    r = requests.get(url)
-    r.raise_for_status()
-    raw_systems = r.json()
+    raw_systems = get_api_data(system_name, "colo_distance")
 
     if system_name not in coords_cache:
-        origin = requests.get(f"{ARDENT_BASE}/{system_name}").json()
+        origin = get_api_data(system_name, "system")
         if all(k in origin for k in ['systemX', 'systemY', 'systemZ']):
             coords_cache[system_name] = (origin['systemX'], origin['systemY'], origin['systemZ'])
         else:
@@ -147,7 +165,7 @@ def find_path(start, targets):
     for t in targets:
         if t not in coords_cache:
             try:
-                data = requests.get(f"{ARDENT_BASE}/{t}").json()
+                data = get_api_data(t, "system")
                 coords_cache[t] = (data['systemX'], data['systemY'], data['systemZ'])
             except Exception:
                 continue
@@ -167,7 +185,7 @@ def find_path(start, targets):
 
         if current not in coords_cache:
             try:
-                data = requests.get(f"{ARDENT_BASE}/{current}").json()
+                data = get_api_data(current, "system")
                 coords_cache[current] = (data['systemX'], data['systemY'], data['systemZ'])
             except Exception:
                 continue
@@ -286,21 +304,6 @@ def live_plot_thread(targets_set):
         plt.draw()
         plt.pause(0.2)
 
-def print_route_with_distances(route):
-    print("\n📡 Final route with distances between jumps:")
-    total_distance = 0.0
-    for i in range(len(route)):
-        print(f"{i+1}. {route[i]}", end="")
-        if i > 0:
-            a = get_coordinates(route[i - 1])
-            b = get_coordinates(route[i])
-            dist = distance_squared(a, b) ** 0.5
-            total_distance += dist
-            print(f" — {dist:.4f} ly from previous")
-        else:
-            print(" (start)")
-    print(f"\n🧮 Total distance: {total_distance:.4f} ly")
-
 if __name__ == "__main__":
     def get_start_system_popup():
         input_root = tk.Tk()
@@ -414,7 +417,7 @@ if __name__ == "__main__":
         route = find_path(start_system, targets)
 
         if route:
-            print_route_with_distances(route)
+            print(route_to_str(route))
 
             def save_route_to_csv(route):
                 start = route[0].replace(" ", "_")
