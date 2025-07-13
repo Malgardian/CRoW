@@ -1,8 +1,6 @@
 import requests
 import heapq
-import json
 import os
-import platform
 import sys
 import threading
 import time
@@ -10,7 +8,6 @@ import csv
 import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.widgets import Button
 import warnings
 warnings.filterwarnings("ignore", message="Starting a Matplotlib GUI outside of the main thread will likely fail")
@@ -24,9 +21,6 @@ latest_status = {"current": "", "target": "", "path_len": 0, "remaining": 0.0, "
 search_stop_event = threading.Event()
 plotting_failed = False
 pause_plot_updates = threading.Event()
-
-
-
 
 def show_route_summary_popup(route):
     def build_text():
