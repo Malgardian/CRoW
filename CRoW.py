@@ -1,17 +1,19 @@
 import requests
 from requests.exceptions import HTTPError, Timeout
 import heapq
-import os
-import sys
+# import os
+# import sys
 import threading
 import time
 import csv
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg #, NavigationToolbar2Tk
 from matplotlib.widgets import Button
-import warnings
-warnings.filterwarnings("ignore", message="Starting a Matplotlib GUI outside of the main thread will likely fail")
+# import warnings
+# warnings.filterwarnings("ignore", message="Starting a Matplotlib GUI outside of the main thread will likely fail")
 
 ARDENT_BASE = "https://api.ardent-insight.com/v2/system/name"
 coords_cache = {}
@@ -26,13 +28,19 @@ pause_plot_updates = threading.Event()
 def distance_squared(a, b):
     return sum((a[i] - b[i]) ** 2 for i in range(3))
 
+def open_link(system_name):
+    """open the provided system on INARA in a new tab in a webbrowser"""
+    system_url = f"https://inara.cz/elite/starsystems/?search={system_name.replace(' ', '+')}"
+    webbrowser.open_new_tab(system_url)
+
 def get_coordinates(system_name):
     if system_name not in coords_cache:
         raise ValueError(f"No cached coordinates for {system_name}")
     return coords_cache[system_name]
 
 def get_api_data(sys_name, task):
-    """talk to the Ardent API to get various data of star systems"""
+    """talk to the Ardent API to get various data of the given star system"""
+    # TODO: fix referencing before assignment
     match task:
         case "refuel_system":
             url = f"{ARDENT_BASE}/{sys_name}/nearest/refuel"
@@ -47,9 +55,12 @@ def get_api_data(sys_name, task):
         print(f"Connection error occurred: {http_err}")
     except Timeout:
         print("Request timed out!")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not resolve system: {sys_name}\n\n{e}")
+        return False
     return r.json()
 
-# maybe rename this one
+# maybe rename this function
 def route_to_str(route):
     lines = ["📡 Final route with distances between jumps:"]
     total = float()
@@ -99,9 +110,113 @@ def show_route_summary_popup(route):
     # Close button
     tk.Button(win, text="Close", command=win.destroy, font=("Helvetica", 11)).pack(pady=5)
 
+def route_search(target_name, win):
+    # showinfo(target_name)
+    # start_value = {"system": None}
+    # start_value["system"] = target_name
+    if target_name == "":
+        messagebox.showwarning(title="Attention!", message="You did not enter a valid system name!\nPlease try again.")
+    else:
+        # create modal popup window to allow the user to select systems to use for the route refining
+        modal = tk.Toplevel()
+        modal.title("Select Target Systems")
+        tk.Label(modal, text="Uncheck any systems you do NOT want to include:", font=("Helvetica", 12)).pack(pady=5)
+        modal.grab_set()
+        modal.wm_attributes("-topmost", True)
 
+        sys_list_frame = tk.Frame(modal)
+        sys_list_frame.pack(padx=10, pady=10)
+        check_vars = {}
 
-def get_populated_targets(start_system):
+        # get the X, Y and Z GalMap coordinates of the starting system + caching
+        start_coords = get_api_data(target_name, "system")
+        coords_cache[target_name] = (start_coords['systemX'], start_coords['systemY'], start_coords['systemZ'])
+
+        # get nearby populated systems
+        targets = get_populated_nearby_systems(target_name)
+        targets_with_dist = []
+        for t in targets:
+            coords = get_api_data(t, "system")
+            coords_cache[t] = (coords['systemX'], coords['systemY'], coords['systemZ'])
+            dist = distance_squared(coords_cache[target_name], coords_cache[t]) ** 0.5
+            targets_with_dist.append((t, dist))
+        targets_with_dist.sort(key=lambda x: x[1]) # maybe improve legibility, sorts by distance ascending
+
+        def add_system_to_popup(systemname):
+            if systemname in check_vars:
+                return
+            coords = get_api_data(systemname, "system")
+            coords_cache[systemname] = (coords['systemX'], coords['systemY'], coords['systemZ'])
+            dist = distance_squared(coords_cache[target_name], coords_cache[systemname]) ** 0.5
+
+            # assemble the checkbox and system row
+            row = tk.Frame(sys_list_frame)
+            row.pack(anchor="w", fill="x")
+            var = tk.BooleanVar(value=True)
+            check_vars[systemname] = var
+            cb = tk.Checkbutton(row, variable=var)
+            cb.pack(side="left")
+            label = tk.Label(row, text=f"{systemname} ({dist:.2f} Ly)", fg="blue", cursor="hand2",
+                             font=("Helvetica", 11))
+            label.pack(side="left")
+            label.bind("<Button-1>", lambda e, name=systemname: open_link(name)) # remove 'e'?
+
+        # adding systems to modal popup dialog
+        for sysname, dist in targets_with_dist:
+            add_system_to_popup(sysname)
+
+        # Add custom input field
+        entry_frame = tk.Frame(modal)
+        entry_frame.pack(pady=(10, 0))
+        tk.Label(entry_frame, text="Add custom system name:", font=("Helvetica", 11)).pack(side="left", padx=(0, 10))
+        custom_entry = tk.Entry(entry_frame, font=("Helvetica", 11), width=30)
+        custom_entry.pack(side="left")
+
+        def add_system():
+            systemname = custom_entry.get().strip()
+            if get_api_data(systemname, "system"): # add caching
+                add_system_to_popup(systemname)
+                custom_entry.delete(0, tk.END)
+
+        tk.Button(modal, text="Add", command=add_system, font=("Helvetica", 11)).pack(pady=5)
+        ttk.Button(modal, text="Start Search", command=lambda: (modal.quit(), modal.destroy())).pack(pady=10)
+        win.wait_window(modal)
+
+        search_targets = [t for t, var in check_vars.items() if var.get()]
+        if not search_targets:
+            messagebox.showinfo("Info", "No targets selected!\nCancelling search.")
+            return
+
+        threading.Thread(target=live_plot_thread, args=(set(search_targets),win), daemon=True).start()
+        route = find_path(target_name, targets)
+        best_route = route
+
+        if route:
+            # print(route_to_str(route))
+            best_len = len(route)
+            save_route_to_csv(best_route)
+            # Ask user if we should keep optimizing
+            continue_search = messagebox.askyesno(
+                "Optimize Route?",
+                f"A route was found from {best_route[0]} to {best_route[-1]} in {best_len} jumps.\n\n"
+                "Would you like to continue searching for a shorter route?"
+            )
+            if continue_search:
+                    while not search_stop_event.is_set():
+                        next_route = find_path(target_name, targets)
+                        if not next_route or len(next_route) >= best_len:
+                            latest_status["optimization_done"] = True
+                            break
+                        best_route = next_route
+                        best_len = len(next_route)
+                        save_route_to_csv(best_route)
+                        messagebox.showinfo("Info", f"Found better route! Now {best_len} jumps.")
+            messagebox.showinfo("Info", "\n✅ Final route saved.")
+        pause_plot_updates.set()
+        show_route_summary_popup(best_route)
+        pause_plot_updates.clear()
+
+def get_populated_nearby_systems(start_system):
     if start_system in refuel_cache:
         return refuel_cache[start_system]
 
@@ -113,10 +228,10 @@ def get_populated_targets(start_system):
     for s in raw_systems:
         if "systemName" in s and "stationType" in s:
             if s["stationType"] in allowed_station_types:
-                filtered.append(s["systemName"])
+                filtered.append(s["systemName"]) # filtering necessary?
                 break
 
-    # Remove duplicates
+    # Remove duplicates ## necessary? better algo?
     unique = []
     seen = set()
     for name in filtered:
@@ -164,18 +279,15 @@ def find_path(start, targets):
 
     for t in targets:
         if t not in coords_cache:
-            try:
-                data = get_api_data(t, "system")
-                coords_cache[t] = (data['systemX'], data['systemY'], data['systemZ'])
-            except Exception:
-                continue
+            data = get_api_data(t, "system")
+            coords_cache[t] = (data['systemX'], data['systemY'], data['systemZ'])
 
     target_coords = {t: coords_cache[t] for t in targets if t in coords_cache}
     heap = [(0, [start], start)]
 
     while heap:
         if search_stop_event.is_set():
-            print("🛑 Search interrupted by user. Returning current partial path.")
+            messagebox.showinfo("🛑 Search interrupted by user. Returning current partial path.")
             return path
 
         _, path, current = heapq.heappop(heap)
@@ -184,11 +296,8 @@ def find_path(start, targets):
         visited.add(current)
 
         if current not in coords_cache:
-            try:
-                data = get_api_data(current, "system")
-                coords_cache[current] = (data['systemX'], data['systemY'], data['systemZ'])
-            except Exception:
-                continue
+            data = get_api_data(current, "system")
+            coords_cache[current] = (data['systemX'], data['systemY'], data['systemZ'])
 
         current_coords = coords_cache[current]
         closest_target, remaining_dist = min(
@@ -223,26 +332,30 @@ def find_path(start, targets):
     plotting_failed=True
     return None
 
-def live_plot_thread(targets_set):
+def live_plot_thread(targets_set, win):
     plt.ion()
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
+    canvas = FigureCanvasTkAgg(fig, win)
+    # toolbar = NavigationToolbar2Tk(canvas, win.plot_frame)
+    # toolbar.update()
+    canvas._tkcanvas.pack(tk.BOTH, expand=1)
 
     # Add Stop and Save button
-    button_ax = fig.add_axes([0.80, 0.01, 0.18, 0.05])
+    button_ax = fig.add_axes((0.80, 0.01, 0.18, 0.05))
     stop_button = Button(button_ax, 'Stop and Save', color='yellow', hovercolor='salmon')
     stop_button.on_clicked(lambda event: search_stop_event.set())
 
-    close_ax = fig.add_axes([0.60, 0.01, 0.18, 0.05])
-    close_button = Button(close_ax, 'Close Plot', color='gray', hovercolor='lightgray')
-
-    def on_close(event):
-        fig.savefig("final_route_plot.png", dpi=300, bbox_inches='tight')
-        print("📸 Saved plot image as final_route_plot.png")
-        plt.close('all')
-        os._exit(0)  # Exit cleanly from all threads
-
-    close_button.on_clicked(on_close)
+    # close_ax = fig.add_axes([0.60, 0.01, 0.18, 0.05])
+    # close_button = Button(close_ax, 'Close Plot', color='gray', hovercolor='lightgray')
+    #
+    # def on_close(event):
+    #     fig.savefig("final_route_plot.png", dpi=300, bbox_inches='tight')
+    #     print("📸 Saved plot image as final_route_plot.png")
+    #     plt.close('all')
+    #     os._exit(0)  # Exit cleanly from all threads
+    #
+    # close_button.on_clicked(on_close)
 
     while True:
         if pause_plot_updates.is_set():
@@ -289,7 +402,7 @@ def live_plot_thread(targets_set):
                 latest_status["plotting_failed"] = True
                 print(f"❌ Plotting error: {e}")
 
-        if latest_status.get("plotting_failed"):
+        if latest_status.get("plotting_failed"): # TODO: Replace with error messagebox?
             ax.text2D(
                 0.5, 0.5,
                 "PLOTTING FAILED",
@@ -304,171 +417,219 @@ def live_plot_thread(targets_set):
         plt.draw()
         plt.pause(0.2)
 
+# TODO: implement dialog to choose save directory
+def save_route_to_csv(route):
+    start = route[0].replace(" ", "_")
+    end = route[-1].replace(" ", "_")
+    filename = f"{start}_to_{end}_in_{len(route)}.csv"
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Step", "System", "X", "Y", "Z", "Distance from Previous"])
+        total = 0.0
+        for i in range(len(route)):
+            coords = get_coordinates(route[i])
+            if i == 0:
+                writer.writerow([1, route[i], *coords, 0])
+            else:
+                prev = get_coordinates(route[i - 1])
+                dist = distance_squared(coords, prev) ** 0.5
+                total += dist
+                writer.writerow([i + 1, route[i], *coords, dist])
+        latest_status["legend_extra"] = f"\nRoute Saved: {filename}\nTotal Distance: {total:.2f} ly"
+    return filename
+
+def main():
+    window = tk.Tk()
+    window.title("CRoW - Colonisation Route Workbench")
+    window.geometry("1000x800")
+
+    # frame for the search field and the route results
+    search_frame = tk.Frame(window, width=400, height=1000)
+    search_frame.pack(padx=4, pady=4)
+
+    # frame for the route plot
+    plot_frame = tk.Frame(window, width=400, height=1000)
+    plot_frame.pack(padx=4, pady=4)
+
+    # Set up entry field for system search
+    entry_label = tk.Label(search_frame, text="Enter target system name:", font=("Helvetica", 12))
+    entry_label.pack(pady=10)
+    entry = tk.Entry(search_frame, font=("Helvetica", 12), width=30)
+    entry.pack()
+
+    # create button to start the route search
+    submit_button = tk.Button(search_frame, text="Search route...", command=lambda: route_search(entry.get().strip(), window), font=("Helvetica", 11))
+    submit_button.pack(pady=10)
+
+    window.mainloop()
+
+
 if __name__ == "__main__":
-    def get_start_system_popup():
-        input_root = tk.Tk()
-        input_root.title("Enter Starting System")
-        input_root.geometry("400x120")
-
-        tk.Label(input_root, text="Enter starting system name:", font=("Helvetica", 12)).pack(pady=10)
-        entry = tk.Entry(input_root, font=("Helvetica", 12), width=30)
-        entry.pack()
-
-        start_value = {"system": None}
-
-        def on_submit():
-            val = entry.get().strip()
-            if val:
-                start_value["system"] = val
-                input_root.quit()
-                input_root.destroy()
-
-        submit_button = tk.Button(input_root, text="Submit", command=on_submit, font=("Helvetica", 11))
-        submit_button.pack(pady=10)
-
-        input_root.mainloop()
-        return start_value["system"]
-
-    start_system = get_start_system_popup()
-
-    if not start_system:
-        print("❌ No starting system entered. Exiting.")
-        sys.exit(0)
-    try:
-        targets = get_populated_targets(start_system)
-
-        # Tkinter popup to filter targets
-        root = tk.Tk()
-        root.title("Select Target Systems")
-        tk.Label(root, text="Uncheck any systems you do NOT want to include:", font=("Helvetica", 12)).pack(pady=5)
-
-        frame = tk.Frame(root)
-        frame.pack(padx=10, pady=10)
-        check_vars = {}
-
-        def open_link(system_name):
-            import webbrowser
-            url = f"https://inara.cz/elite/starsystems/?search={system_name.replace(' ', '+')}"
-            webbrowser.open_new_tab(url)
-
-        start_coords = requests.get(f"{ARDENT_BASE}/{start_system}").json()
-        coords_cache[start_system] = (start_coords['systemX'], start_coords['systemY'], start_coords['systemZ'])
-
-        targets_with_dist = []
-        for t in targets:
-            try:
-                coords = requests.get(f"{ARDENT_BASE}/{t}").json()
-                coords_cache[t] = (coords['systemX'], coords['systemY'], coords['systemZ'])
-                dist = distance_squared(coords_cache[start_system], coords_cache[t]) ** 0.5
-                targets_with_dist.append((t, dist))
-            except Exception:
-                continue
-
-        targets_with_dist.sort(key=lambda x: x[1])
-
-        def add_system_to_popup(system_name):
-            try:
-                if system_name in check_vars:
-                    return  # prevent duplicate
-                coords = requests.get(f"{ARDENT_BASE}/{system_name}").json()
-                coords_cache[system_name] = (coords['systemX'], coords['systemY'], coords['systemZ'])
-                dist = distance_squared(coords_cache[start_system], coords_cache[system_name]) ** 0.5
-
-                row = tk.Frame(frame)
-                row.pack(anchor="w", fill="x")
-                var = tk.BooleanVar(value=True)
-                check_vars[system_name] = var
-                cb = tk.Checkbutton(row, variable=var)
-                cb.pack(side="left")
-                label = tk.Label(row, text=f"{system_name} ({dist:.2f} ly)", fg="blue", cursor="hand2", font=("Helvetica", 11))
-                label.pack(side="left")
-                label.bind("<Button-1>", lambda e, name=system_name: open_link(name))
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not resolve system: {system_name}\n\n{e}")
-
-        # Populate initial target checkboxes
-        for t, dist in targets_with_dist:
-            add_system_to_popup(t)
-
-        # Add custom input field
-        entry_frame = tk.Frame(root)
-        entry_frame.pack(pady=(10, 0))
-        tk.Label(entry_frame, text="Add custom system name:", font=("Helvetica", 11)).pack(side="left", padx=(0, 10))
-        custom_entry = tk.Entry(entry_frame, font=("Helvetica", 11), width=30)
-        custom_entry.pack(side="left")
-
-        def on_add():
-            name = custom_entry.get().strip()
-            if name:
-                add_system_to_popup(name)
-                custom_entry.delete(0, tk.END)
-
-        tk.Button(root, text="Add", command=on_add, font=("Helvetica", 11)).pack(pady=5)
-
-        ttk.Button(root, text="Start Search", command=lambda: (root.quit(), root.destroy())).pack(pady=10)
-        root.mainloop()
-
-        targets = [t for t, var in check_vars.items() if var.get()]
-        if not targets:
-            print("❌ No targets selected. Exiting.")
-            sys.exit(0)
-
-        threading.Thread(target=live_plot_thread, args=(set(targets),), daemon=True).start()
-        route = find_path(start_system, targets)
-
-        if route:
-            print(route_to_str(route))
-
-            def save_route_to_csv(route):
-                start = route[0].replace(" ", "_")
-                end = route[-1].replace(" ", "_")
-                filename = f"{start}_to_{end}_in_{len(route)}.csv"
-                with open(filename, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["Step", "System", "X", "Y", "Z", "Distance from Previous"])
-                    total = 0.0
-                    for i in range(len(route)):
-                        coords = get_coordinates(route[i])
-                        if i == 0:
-                            writer.writerow([1, route[i], *coords, 0])
-                        else:
-                            prev = get_coordinates(route[i-1])
-                            dist = distance_squared(coords, prev) ** 0.5
-                            total += dist
-                            writer.writerow([i+1, route[i], *coords, dist])
-                    latest_status["legend_extra"] = f"\nRoute Saved: {filename}\nTotal Distance: {total:.2f} ly"
-                return filename
-
-            best_route = route
-            best_len = len(route)
-            save_route_to_csv(best_route)
-            # Ask user if we should keep optimizing
-            root = tk.Tk()
-            root.withdraw()
-            continue_search = messagebox.askyesno(
-                "Optimize Route?",
-                f"A route was found from {best_route[0]} to {best_route[-1]} in {best_len} jumps.\n\n"
-                "Would you like to continue searching for a shorter route?"
-            )
-            root.destroy()
-            if continue_search:
-                    while not search_stop_event.is_set():
-                        next_route = find_path(start_system, targets)
-                        if not next_route or len(next_route) >= best_len:
-                            latest_status["optimization_done"] = True
-                            break
-                        best_route = next_route
-                        best_len = len(next_route)
-                        save_route_to_csv(best_route)
-                        print(f"\n🔁 Found better route! Now {best_len} jumps.")
-            print("\n✅ Final route saved. Plot will remain open. Press Ctrl+C to exit.")
-        pause_plot_updates.set()
-        show_route_summary_popup(best_route)
-        pause_plot_updates.clear()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n👋 Exiting.")
-    except Exception as e:
-        print(f"⚠️ Error: {e}")
+    main()
+    # def get_start_system_popup():
+    #     input_root = tk.Tk()
+    #     input_root.title("Enter Starting System")
+    #     input_root.geometry("400x120")
+    #
+    #     tk.Label(input_root, text="Enter starting system name:", font=("Helvetica", 12)).pack(pady=10)
+    #     entry = tk.Entry(input_root, font=("Helvetica", 12), width=30)
+    #     entry.pack()
+    #
+    #     start_value = {"system": None}
+    #
+    #     def on_submit():
+    #         val = entry.get().strip()
+    #         if val:
+    #             start_value["system"] = val
+    #             input_root.quit()
+    #             input_root.destroy()
+    #
+    #     submit_button = tk.Button(input_root, text="Submit", command=on_submit, font=("Helvetica", 11))
+    #     submit_button.pack(pady=10)
+    #
+    #     input_root.mainloop()
+    #     return start_value["system"]
+    #
+    # start_system = get_start_system_popup()
+    #
+    # if not start_system:
+    #     print("❌ No starting system entered. Exiting.")
+    #     sys.exit(0)
+    # try:
+    #     targets = get_populated_nearby_systems(start_system)
+    #
+    #     # Tkinter popup to filter targets
+    #     root = tk.Tk()
+    #     root.title("Select Target Systems")
+    #     tk.Label(root, text="Uncheck any systems you do NOT want to include:", font=("Helvetica", 12)).pack(pady=5)
+    #
+    #     frame = tk.Frame(root)
+    #     frame.pack(padx=10, pady=10)
+    #     check_vars = {}
+    #
+    #     def open_link(system_name):
+    #         import webbrowser
+    #         url = f"https://inara.cz/elite/starsystems/?search={system_name.replace(' ', '+')}"
+    #         webbrowser.open_new_tab(url)
+    #
+    #     start_coords = requests.get(f"{ARDENT_BASE}/{start_system}").json()
+    #     coords_cache[start_system] = (start_coords['systemX'], start_coords['systemY'], start_coords['systemZ'])
+    #
+    #     targets_with_dist = []
+    #     for t in targets:
+    #         try:
+    #             coords = requests.get(f"{ARDENT_BASE}/{t}").json()
+    #             coords_cache[t] = (coords['systemX'], coords['systemY'], coords['systemZ'])
+    #             dist = distance_squared(coords_cache[start_system], coords_cache[t]) ** 0.5
+    #             targets_with_dist.append((t, dist))
+    #         except Exception:
+    #             continue
+    #
+    #     targets_with_dist.sort(key=lambda x: x[1])
+    #
+    #     def add_system_to_popup(system_name):
+    #         try:
+    #             if system_name in check_vars:
+    #                 return  # prevent duplicate
+    #             coords = requests.get(f"{ARDENT_BASE}/{system_name}").json()
+    #             coords_cache[system_name] = (coords['systemX'], coords['systemY'], coords['systemZ'])
+    #             dist = distance_squared(coords_cache[start_system], coords_cache[system_name]) ** 0.5
+    #
+    #             row = tk.Frame(frame)
+    #             row.pack(anchor="w", fill="x")
+    #             var = tk.BooleanVar(value=True)
+    #             check_vars[system_name] = var
+    #             cb = tk.Checkbutton(row, variable=var)
+    #             cb.pack(side="left")
+    #             label = tk.Label(row, text=f"{system_name} ({dist:.2f} ly)", fg="blue", cursor="hand2", font=("Helvetica", 11))
+    #             label.pack(side="left")
+    #             label.bind("<Button-1>", lambda e, name=system_name: open_link(name))
+    #         except Exception as e:
+    #             messagebox.showerror("Error", f"Could not resolve system: {system_name}\n\n{e}")
+    #
+    #     # Populate initial target checkboxes
+    #     for t, dist in targets_with_dist:
+    #         add_system_to_popup(t)
+    #
+    #     # Add custom input field
+    #     entry_frame = tk.Frame(root)
+    #     entry_frame.pack(pady=(10, 0))
+    #     tk.Label(entry_frame, text="Add custom system name:", font=("Helvetica", 11)).pack(side="left", padx=(0, 10))
+    #     custom_entry = tk.Entry(entry_frame, font=("Helvetica", 11), width=30)
+    #     custom_entry.pack(side="left")
+    #
+    #     def on_add():
+    #         name = custom_entry.get().strip()
+    #         if name:
+    #             add_system_to_popup(name)
+    #             custom_entry.delete(0, tk.END)
+    #
+    #     tk.Button(root, text="Add", command=on_add, font=("Helvetica", 11)).pack(pady=5)
+    #
+    #     ttk.Button(root, text="Start Search", command=lambda: (root.quit(), root.destroy())).pack(pady=10)
+    #     root.mainloop()
+    #
+    #     targets = [t for t, var in check_vars.items() if var.get()]
+    #     if not targets:
+    #         print("❌ No targets selected. Exiting.")
+    #         sys.exit(0)
+    #
+    #     threading.Thread(target=live_plot_thread, args=(set(targets),), daemon=True).start()
+    #     route = find_path(start_system, targets)
+    #
+    #     if route:
+    #         print(route_to_str(route))
+    #
+    #         def save_route_to_csv(route):
+    #             start = route[0].replace(" ", "_")
+    #             end = route[-1].replace(" ", "_")
+    #             filename = f"{start}_to_{end}_in_{len(route)}.csv"
+    #             with open(filename, "w", newline="") as f:
+    #                 writer = csv.writer(f)
+    #                 writer.writerow(["Step", "System", "X", "Y", "Z", "Distance from Previous"])
+    #                 total = 0.0
+    #                 for i in range(len(route)):
+    #                     coords = get_coordinates(route[i])
+    #                     if i == 0:
+    #                         writer.writerow([1, route[i], *coords, 0])
+    #                     else:
+    #                         prev = get_coordinates(route[i-1])
+    #                         dist = distance_squared(coords, prev) ** 0.5
+    #                         total += dist
+    #                         writer.writerow([i+1, route[i], *coords, dist])
+    #                 latest_status["legend_extra"] = f"\nRoute Saved: {filename}\nTotal Distance: {total:.2f} ly"
+    #             return filename
+    #
+    #         best_route = route
+    #         best_len = len(route)
+    #         save_route_to_csv(best_route)
+    #         # Ask user if we should keep optimizing
+    #         root = tk.Tk()
+    #         root.withdraw()
+    #         continue_search = messagebox.askyesno(
+    #             "Optimize Route?",
+    #             f"A route was found from {best_route[0]} to {best_route[-1]} in {best_len} jumps.\n\n"
+    #             "Would you like to continue searching for a shorter route?"
+    #         )
+    #         root.destroy()
+    #         if continue_search:
+    #                 while not search_stop_event.is_set():
+    #                     next_route = find_path(start_system, targets)
+    #                     if not next_route or len(next_route) >= best_len:
+    #                         latest_status["optimization_done"] = True
+    #                         break
+    #                     best_route = next_route
+    #                     best_len = len(next_route)
+    #                     save_route_to_csv(best_route)
+    #                     print(f"\n🔁 Found better route! Now {best_len} jumps.")
+    #         print("\n✅ Final route saved. Plot will remain open. Press Ctrl+C to exit.")
+    #     pause_plot_updates.set()
+    #     show_route_summary_popup(best_route)
+    #     pause_plot_updates.clear()
+    #     try:
+    #         while True:
+    #             time.sleep(1)
+    #     except KeyboardInterrupt:
+    #         print("\n👋 Exiting.")
+    # except Exception as e:
+    #     print(f"⚠️ Error: {e}")
